@@ -1,139 +1,118 @@
 """
 Main generator logic for release notes generation.
-Uses OpenAI library pointing to Ollama at http://localhost:11434/v1
+Uses OpenAI-compatible client (Ollama by default).
 """
-
+import json
+import logging
 import time
 from openai import OpenAI
 
-# Configuration constants
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
-OLLAMA_API_KEY = "ollama"
-OLLAMA_MODEL = "llama3.2"
+import config
+from prompts import SYSTEM_PROMPT, build_prompt
 
-# Required fields in output
-REQUIRED_FIELDS = ['VERSION', 'DATE', 'TYPE', 'SUMMARY', 'CHANGES', 'TECHNICAL', 'IMPACT', 'ROLLBACK']
-
-# Termination safety layers
-TERMINATION_CONDITION_FIELDS = REQUIRED_FIELDS
-MAX_RETRIES = 3
-TIMEOUT_SECONDS = 90
-LOOP_DETECTION_THRESHOLD = 3
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
-def generate_release_notes(commits_text: str, pipeline_name: str, environment: str) -> dict:
+def generate_release_notes(
+    commits_text: str,
+    pipeline_name: str,
+    environment: str,
+) -> dict:
     """
-    Generate release notes from commit messages using Ollama.
+    Generate structured release notes from commit messages using an LLM.
 
     Args:
         commits_text: Formatted commit messages
         pipeline_name: Name of the pipeline
-        environment: Deployment environment
+        environment: Deployment environment (e.g. prod, staging)
 
     Returns:
         Dictionary containing the release notes fields
     """
-    from prompts import SYSTEM_PROMPT, build_prompt
-
-    # Build the user message
     user_message = build_prompt(commits_text, pipeline_name, environment)
 
-    # Initialize the OpenAI client pointing to Ollama
     client = OpenAI(
-        base_url=OLLAMA_BASE_URL,
-        api_key=OLLAMA_API_KEY,
-        timeout=TIMEOUT_SECONDS
+        base_url=config.BASE_URL,
+        api_key=config.API_KEY,
+        timeout=config.TIMEOUT_SECONDS,
     )
 
-    # Track outputs for loop detection
-    previous_outputs = []
+    previous_outputs: list[str] = []
     retry_count = 0
 
-    while retry_count < MAX_RETRIES:
+    while retry_count < config.MAX_RETRIES:
         try:
-            # Make ONE LLM call
+            log.info("Calling LLM (attempt %d/%d)", retry_count + 1, config.MAX_RETRIES)
             response = client.chat.completions.create(
-                model=OLLAMA_MODEL,
+                model=config.MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
+                    {"role": "user", "content": user_message},
                 ],
-                temperature=0.2,
-                max_tokens=2048
+                temperature=config.TEMPERATURE,
+                max_tokens=config.MAX_TOKENS,
             )
 
-            # Extract the generated content
-            generated_content = response.choices[0].message.content
+            content = response.choices[0].message.content.strip()
 
-            # Clean up the response
-            generated_content = generated_content.strip()
+            # Strip markdown fences if present
+            if content.startswith("```json"):
+                content = content[7:]
+            elif content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
 
-            # Parse the output into a dictionary
-            notes = parse_release_notes(generated_content)
-
-            # Layer 1: Check that all required fields are present
-            missing_fields = [f for f in REQUIRED_FIELDS if f not in notes or not notes[f]]
-            if missing_fields:
-                print(f"Warning: Missing fields: {missing_fields}. Retrying...")
+            # Parse JSON
+            try:
+                release_notes = json.loads(content)
+            except json.JSONDecodeError as exc:
+                log.warning("JSON parse failed: %s. Retrying...", exc)
                 retry_count += 1
-                time.sleep(2 ** retry_count)  # Exponential backoff
+                time.sleep(2 ** retry_count)
                 continue
 
-            print("All required fields present!")
-            print(f"VERSION: {notes.get('VERSION', 'N/A')}")
-            print(f"TYPE: {notes.get('TYPE', 'N/A')}")
+            # Validate required fields
+            missing = [f for f in config.REQUIRED_FIELDS if f not in release_notes]
+            if missing:
+                log.warning("Missing required fields: %s. Retrying...", missing)
+                retry_count += 1
+                time.sleep(2 ** retry_count)
+                continue
 
-            # Layer 4: Loop detection
-            output_str = str(notes)
-            if output_str in previous_outputs:
-                print("Loop detected: same output repeated. Retrying with different approach...")
+            # Loop detection
+            content_key = json.dumps(release_notes, sort_keys=True)
+            if content_key in previous_outputs:
+                log.warning("Loop detected: identical output repeated. Retrying...")
                 previous_outputs.clear()
                 retry_count += 1
                 time.sleep(2 ** retry_count)
                 continue
 
-            previous_outputs.append(output_str)
+            previous_outputs.append(content_key)
+            if len(previous_outputs) >= config.LOOP_DETECTION_THRESHOLD:
+                log.warning("Loop detection threshold reached. Using last output.")
+                return release_notes
 
-            # If we have 3 repeated outputs, break the loop
-            if len(previous_outputs) >= LOOP_DETECTION_THRESHOLD:
-                print("Loop detection threshold reached. Using last output.")
-                break
+            log.info("Release notes generated successfully")
+            return release_notes
 
-            # Success - return the parsed notes
-            return notes
-
-        except Exception as e:
-            print(f"Error during generation: {e}")
+        except Exception as exc:
+            log.error("Error during generation: %s", exc)
             retry_count += 1
-            if retry_count >= MAX_RETRIES:
-                raise Exception(f"Failed after {MAX_RETRIES} retries: {e}")
-            # Exponential backoff
+            if retry_count >= config.MAX_RETRIES:
+                raise RuntimeError(
+                    f"Failed after {config.MAX_RETRIES} retries: {exc}"
+                ) from exc
             wait_time = 2 ** retry_count
-            print(f"Retrying in {wait_time} seconds...")
+            log.info("Retrying in %d seconds...", wait_time)
             time.sleep(wait_time)
 
-    # If we exhaust retries, raise an exception
-    raise Exception(f"Failed to generate valid release notes after {MAX_RETRIES} retries")
-
-
-def parse_release_notes(content: str) -> dict:
-    """
-    Parse the release notes output from the LLM.
-
-    Args:
-        content: The raw output from the LLM
-
-    Returns:
-        Dictionary with release note fields
-    """
-    notes = {}
-    lines = content.strip().split('\n')
-
-    for line in lines:
-        line = line.strip()
-        if ':' in line:
-            key = line.split(':')[0].strip()
-            value = line.split(':', 1)[1].strip()
-            notes[key] = value
-
-    return notes
+    raise RuntimeError(
+        f"Failed to generate valid release notes after {config.MAX_RETRIES} retries"
+    )
