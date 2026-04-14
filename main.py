@@ -1,100 +1,100 @@
 """
-Main entry point for the AI Release Notes Generator.
-Runs all four commit batches and generates release notes.
+Main entry point for AI Release Notes Generator.
+Supports CLI args to select pipelines and export results.
 """
-
+import argparse
+import json
+import logging
 import os
 import sys
 
-# Add the current directory to path to allow imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mock_commits import get_commits, format_commits_for_prompt
+import config
+from mock_commits import get_commits, get_pipeline_info
 from generator import generate_release_notes
-from slack_notifier import post_release_to_slack
+from slack_notifier import send_slack_notification
+
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger(__name__)
+
+ALL_PIPELINES = ["backend_api", "frontend_app", "data_pipeline", "mobile_app"]
 
 
-# Pipeline and environment configurations for each batch
-BATCH_CONFIG = {
-    "feature_release": {
-        "pipeline_name": "my-app-pipeline",
-        "environment": "production"
-    },
-    "hotfix_release": {
-        "pipeline_name": "payment-service-pipeline",
-        "environment": "production"
-    },
-    "infra_release": {
-        "pipeline_name": "infra-pipeline",
-        "environment": "staging"
-    },
-    "security_release": {
-        "pipeline_name": "security-pipeline",
-        "environment": "production"
-    }
-}
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="AI Release Notes Generator — convert Git commits to structured release notes"
+    )
+    parser.add_argument(
+        "--pipelines",
+        nargs="+",
+        default=ALL_PIPELINES,
+        choices=ALL_PIPELINES,
+        help="Pipelines to generate release notes for (default: all)",
+    )
+    parser.add_argument(
+        "--output-json",
+        metavar="FILE",
+        help="Write results summary to a JSON file",
+    )
+    parser.add_argument(
+        "--no-slack",
+        action="store_true",
+        help="Skip Slack notification",
+    )
+    return parser.parse_args()
 
-# List of batches to process
-BATCHES = ["feature_release", "hotfix_release", "infra_release", "security_release"]
 
+def main() -> None:
+    args = parse_args()
+    pipelines = args.pipelines
 
-def main():
-    """
-    Run all four commit batches and generate release notes.
-    """
-    print("\n" + "=" * 70)
-    print("AI RELEASE NOTES GENERATOR")
-    print("=" * 70 + "\n")
+    log.info("AI RELEASE NOTES GENERATOR")
+    log.info("Processing %d pipeline(s): %s", len(pipelines), pipelines)
 
-    for batch in BATCHES:
-        config = BATCH_CONFIG[batch]
-        pipeline_name = config["pipeline_name"]
-        environment = config["environment"]
+    results = []
 
-        print(f"\n{'='*70}")
-        print(f"BATCH: {batch}")
-        print(f"Pipeline: {pipeline_name} | Environment: {environment}")
-        print(f"{'='*70}\n")
-
-        # Get commits for this batch
-        commits = get_commits(batch)
-        commits_text = format_commits_for_prompt(commits)
-
-        print("Commits in this release:")
-        print("-" * 70)
-        print(commits_text)
-        print("-" * 70)
-
-        print("\nGenerating release notes...")
+    for pipeline in pipelines:
+        log.info("--- Pipeline: %s ---", pipeline)
 
         try:
-            # Generate release notes
-            notes = generate_release_notes(commits_text, pipeline_name, environment)
+            commits_text = get_commits(pipeline)
+            pipeline_name, environment = get_pipeline_info(pipeline)
 
-            # Print raw release notes
-            print("\nGenerated Release Notes:")
-            print("-" * 70)
-            for key in ['VERSION', 'DATE', 'TYPE', 'SUMMARY', 'CHANGES', 'TECHNICAL', 'IMPACT', 'ROLLBACK']:
-                if key in notes:
-                    print(f"{key}: {notes[key]}")
-            print("-" * 70)
+            release_notes = generate_release_notes(commits_text, pipeline_name, environment)
 
-            # Post to Slack
-            post_release_to_slack(notes, pipeline_name, environment)
+            log.info(
+                "Generated notes for %s: %s (%s)",
+                pipeline,
+                release_notes.get("TYPE", "UNKNOWN"),
+                release_notes.get("VERSION", "v?.?.?"),
+            )
 
-        except Exception as e:
-            print(f"\nERROR: Failed to generate release notes for {batch}")
-            print(f"Error details: {e}\n")
-            continue
+            if not args.no_slack and config.SLACK_WEBHOOK_URL:
+                send_slack_notification(release_notes, pipeline_name, environment)
+                log.info("Slack notification sent")
 
-        # Print separator between batches
-        print("\n" + "=" * 70)
-        print("BATCH COMPLETED")
-        print("=" * 70 + "\n")
+            results.append({
+                "pipeline": pipeline,
+                "status": "success",
+                "type": release_notes.get("TYPE"),
+                "version": release_notes.get("VERSION"),
+            })
 
-    print("\n" + "=" * 70)
-    print("ALL BATCHES COMPLETED")
-    print("=" * 70 + "\n")
+        except Exception as exc:
+            log.error("Failed for pipeline '%s': %s", pipeline, exc)
+            results.append({"pipeline": pipeline, "status": "error", "error": str(exc)})
+
+    success_count = sum(1 for r in results if r["status"] == "success")
+    log.info("Completed: %d/%d succeeded", success_count, len(results))
+
+    if args.output_json:
+        with open(args.output_json, "w") as f:
+            json.dump(results, f, indent=2)
+        log.info("Results written to %s", args.output_json)
 
 
 if __name__ == "__main__":
